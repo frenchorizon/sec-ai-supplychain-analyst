@@ -1,0 +1,215 @@
+import os
+import re
+import time
+import logging
+from typing import List, Dict, Optional
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import anthropic
+
+# Configuration du Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+class SECSupplyChainAnalyst:
+    def __init__(self):
+        # Configuration impérative SEC : Nom + Email réels requis
+        self.user_agent = os.getenv("SEC_USER_AGENT", "FinTechResearchEngine/1.0 (analyst@alpha-quant-intelligence.com)")
+        self.headers = {"User-Agent": self.user_agent}
+        
+        # Initialisation du client Anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("CRITICAL: La clé ANTHROPIC_API_KEY est manquante dans l'environnement.")
+        self.ai_client = anthropic.Anthropic(api_key=api_key)
+        self.model = "claude-3-5-sonnet"
+
+    def _get_cik(self, ticker: str) -> str:
+        """Traduit un Ticker en CIK normalisé à 10 chiffres (requis par l'API SEC)."""
+        url = "https://www.sec.gov/files/company_tickers.json"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            ticker_upper = ticker.upper()
+            for _, company in data.items():
+                if company["ticker"] == ticker_upper:
+                    return str(company["cik_str"]).zfill(10)
+            raise ValueError(f"Ticker {ticker} introuvable sur la SEC.")
+        except Exception as e:
+            logger.error(f"Erreur lors de la récupération du CIK pour {ticker}: {str(e)}")
+            raise
+
+    def _get_latest_10k_url(self, cik: str) -> str:
+        """Récupère l'URL du dernier rapport 10-K disponible."""
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            submissions = response.json()["filings"]["recent"]
+            
+            for i, form in enumerate(submissions["form"]):
+                if form == "10-K":
+                    accession = submissions["accessionNumber"][i].replace("-", "")
+                    doc_name = submissions["primaryDocument"][i]
+                    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{doc_name}"
+            raise ValueError(f"Aucun 10-K trouvé pour le CIK {cik}.")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'accès aux soumissions SEC: {str(e)}")
+            raise
+
+    def extract_strategic_sections(self, url: str) -> str:
+        """Extrait et nettoie le texte brut du document en ciblant Item 1A et Item 7."""
+        logger.info(f"Téléchargement du 10-K depuis: {url}")
+        try:
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            
+            # Nettoyage HTML avec BeautifulSoup
+            soup = BeautifulSoup(response.text, "lxml")
+            
+            # Tweak Portfolio : Suppression des tableaux financiers complexes pour maximiser la qualité sémantique
+            for table in soup.find_all('table'):
+                table.decompose()
+                
+            raw_text = soup.get_text(separator="\n")
+            
+            # Normalisation des espaces et sauts de ligne
+            clean_text = re.sub(r'\s+', ' ', raw_text)
+            
+            # Extraction par heuristique des sections critiques (Item 1A et Item 7)
+            start_keywords = ["Item 1A.", "ITEM 1A.", "Risk Factors"]
+            end_keywords = ["Item 1B.", "ITEM 1B.", "Item 2.", "ITEM 2."]
+            
+            extracted_content = []
+            for start in start_keywords:
+                start_idx = clean_text.find(start)
+                if start_idx != -1:
+                    end_idx = len(clean_text)
+                    for end in end_keywords:
+                        pos = clean_text.find(end, start_idx + 100)
+                        if pos != -1 and pos < end_idx:
+                            end_idx = pos
+                    extracted_content.append(clean_text[start_idx:end_idx])
+                    break
+            
+            if not extracted_content:
+                logger.warning("Extraction ciblée incomplète. Récupération par bloc par défaut.")
+                return clean_text[:200000]
+                
+            return "\n\n".join(extracted_content)
+        except Exception as e:
+            logger.error(f"Erreur lors du parsing du document HTML: {str(e)}")
+            raise
+
+    def chunk_text(self, text: str, chunk_size: int = 15000) -> List[str]:
+        """Découpe le texte de manière séquentielle pour respecter la fenêtre de contexte."""
+        words = text.split(" ")
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            current_chunk.append(word)
+            current_length += len(word) + 1
+            if current_length >= chunk_size:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+        return chunks
+
+    def analyze_risk_chunk(self, chunk: str, ticker: str) -> str:
+        """Analyse un bloc spécifique via Claude 3.5 Sonnet avec focus asymétrique."""
+        system_prompt = (
+            "Tu es un analyste financier senior spécialisé dans l'intelligence économique et les chaînes d'approvisionnement critiques.\n"
+            f"Ton objectif est d'analyser cet extrait de document SEC pour le ticker {ticker}.\n"
+            "Tu devez identifier uniquement les signaux faibles, les dépendances critiques, et les risques réels occultés par la langue de bois d'entreprise.\n"
+            "Constate les faits : dépendances à un fournisseur unique (ex: TSMC, ASML), goulots d'étranglement de packaging (CoWoS, CPO), "
+            "embargos géopolitiques, pénuries de composants critiques, ou barrières IP/brevets.\n"
+            "Ne génère aucun blabla introductif. Soyons ultra-directs et factuels."
+        )
+        
+        user_prompt = f"Analyse l'extrait suivant et isole les faits majeurs liés aux goulots technologiques et logistiques :\n\n{chunk}"
+        
+        for attempt in range(3):
+            try:
+                message = self.ai_client.messages.create(
+                    model=self.model,
+                    max_tokens=1500,
+                    temperature=0.0,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+                return message.content[0].text
+            except anthropic.RateLimitError:
+                wait_time = (attempt + 1) * 5
+                logger.warning(f"Rate limit atteint sur l'API Anthropic. Pause de {wait_time}s...")
+                time.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Erreur API Anthropic: {str(e)}")
+                return f"[Erreur d'analyse sur ce segment : {str(e)}]"
+        return "[Erreur critique : Rate limit persistant]"
+
+    def synthesis_report(self, analyses: List[str], ticker: str) -> str:
+        """Génère la synthèse finale structurée au format Markdown exact exigé."""
+        system_prompt = (
+            "Tu es l'architecte IA en chef. Compile les analyses fragmentées suivantes en un rapport final unifié, structuré et ultra-scannable.\n"
+            "Tu respecteras STRICTEMENT le plan suivant en utilisant des puces descriptives et percutantes :\n"
+            "🎯 Résumé Exécutif des Risques Subis\n"
+            "⚠️ Goulots d'Étranglement Technologiques Majeurs (Dépendance IP, brevets, R&D)\n"
+            "⛓️ Goulots d'Étranglement Logistiques & Supply Chain (Fournisseurs uniques, matières premières)\n"
+            "📊 Niveau de Risque Global (Score de 1 à 5 avec justification claire et tranchée)\n"
+            "Ne mets aucune phrase d'introduction ni de conclusion."
+        )
+        
+        combined_analyses = "\n\n--- COMPOSANTE --- \n\n".join(analyses)
+        
+        try:
+            message = self.ai_client.messages.create(
+                model=self.model,
+                max_tokens=2500,
+                temperature=0.2,
+                system=system_prompt,
+                messages=[{"role": "user", "content": f"Génère le rapport final pour {ticker} à partir de ces données :\n\n{combined_analyses}"}]
+            )
+            return message.content[0].text
+        except Exception as e:
+            logger.error(f"Erreur lors de la synthèse finale : {str(e)}")
+            raise
+
+    def run(self, ticker: str, output_path: str = "report.md"):
+        """Pipeline d'exécution principal."""
+        logger.info(f"Démarrage de l'analyse pour le Ticker: {ticker}")
+        
+        cik = self._get_cik(ticker)
+        url = self._get_latest_10k_url(cik)
+        raw_content = self.extract_strategic_sections(url)
+        
+        chunks = self.chunk_text(raw_content)
+        logger.info(f"Texte découpé en {len(chunks)} chunks pour analyse.")
+        
+        intermediate_analyses = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Analyse du chunk {i+1}/{len(chunks)}...")
+            analysis = self.analyze_risk_chunk(chunk, ticker)
+            intermediate_analyses.append(analysis)
+            time.sleep(0.5)
+            
+        final_report = self.synthesis_report(intermediate_analyses, ticker)
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(final_report)
+            
+        logger.info(f"Rapport d'analyse asymétrique généré avec succès : {output_path}")
+
+if __name__ == "__main__":
+    TARGET_TICKER = "NVDA" 
+    
+    analyst = SECSupplyChainAnalyst()
+    analyst.run(ticker=TARGET_TICKER, output_path=f"report_{TARGET_TICKER}.md")
