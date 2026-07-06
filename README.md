@@ -51,3 +51,16 @@ Dépendance extrême à un écosystème ultra-centralisé de fonderies et de pac
 
 📊 **Niveau de Risque Global**
 * **Score : 4/5** -> Risque géopolitique (Taïwan) et technique maximal, atténué uniquement par le pouvoir de pricing de l'entreprise sur ses clients.
+
+---
+### 🔍 Et si on devait le faire manuellement ? (Méthodologie d'Audit)
+Si vous ne voulez pas passer par l'automatisation, voici la procédure "chirurgicale" pour extraire ces informations directement à la source :
+
+1. **Accès EDGAR** : Rendez-vous sur le site officiel de la SEC (Edgar Company Search).
+2. **Recherche de Ticker** : Tapez le symbole de l'entreprise (ex: NVDA).
+3. **Filtrage** : Filtrez les résultats pour ne garder que les formulaires **10-K** (le rapport annuel).
+4. **Audit de l'Item 1A** : Ouvrez le rapport HTML et cherchez la section **"Item 1A. Risk Factors"**.
+5. **Analyse de contenu** : Scannez les paragraphes traitant du "Manufacturing" et des "Suppliers". C'est ici que l'entreprise est légalement contrainte de divulguer ses vulnérabilités critiques (ex: dépendance TSMC, CoWoS).
+
+*Pourquoi c'est important ?* : L'automatisation est une question de vitesse, mais la compréhension manuelle est une question de maîtrise. Ne faites jamais confiance à une analyse IA sans avoir vérifié la section "Risk Factors" à la source.
+---
